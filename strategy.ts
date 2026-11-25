@@ -150,7 +150,6 @@ interface Ride {
   opened: number;
   invested: number;
   exiting: boolean;
-  filled: boolean;
 }
 
 export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
@@ -281,7 +280,6 @@ export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
           if (!pendingByMint.has(mint)) rides.delete(mint);
           continue;
         }
-        r.filled = true;
         if (curve === undefined || curve.complete) continue;
         const mk = marks.get(mint);
         const vq = mk ? Number(mk.virtual_quote_reserves) : Number(curve.virtual_quote_reserves);
@@ -348,7 +346,7 @@ export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
         orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
         free -= amount + tx;
         exposure += amount;
-        rides.set(mint, { opened: now, invested: amount, exiting: false, filled: false });
+        rides.set(mint, { opened: now, invested: amount, exiting: false });
         t.entered = true;
         slotsLeft--;
         mainLeft--;
