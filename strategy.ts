@@ -20,6 +20,10 @@
 //   smallest qualifying size) on liquid curves whose tape still shows net buying — buy a
 //   little, sell it as soon as the buy lands — until it is back on pace.
 //
+//   Risk book (risk.ts): the stake is not fixed — it shrinks while realised drawdown grows
+//   and while many positions are open at once; total exposure and concurrent positions are
+//   capped; and a coin whose last exit lost money is not re-entered for 200 slots.
+//
 // What was tried and left out: buying older "continuation" curves (their tape looks alive but
 // the entries buy tops — it lost ~0.33 SOL on the dev window), a trailing stop (it never fired
 // before take-profit / stop / max-hold did), and re-entering a coin after an exit (one entry
@@ -31,6 +35,7 @@
 // comes from the replay data, not the wall clock) is used only for pacing.
 
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/agentfun-bot.ts';
+import { RiskBook, type RiskParams } from './risk.ts';
 
 export interface RiderParams {
   /** SOL staked in one position (single buy, no adds). */
@@ -87,6 +92,17 @@ export interface RiderParams {
   /** Probe only a curve whose net SOL flow over this many slots is at least probeMinFlow. */
   probeFlowWindow: number;
   probeMinFlow: number;
+
+  /** Risk book (risk.ts): realised drawdown at which the stake starts shrinking. */
+  riskDrawdownKneeSol: number;
+  /** Risk book: realised drawdown at which the stake reaches its floor factor. */
+  riskDrawdownCapSol: number;
+  /** Risk book: smallest stake multiplier, reached at the drawdown cap. */
+  riskMinStakeFactor: number;
+  /** Risk book: extra stake shrink per open position beyond the first. */
+  riskPerPositionShrink: number;
+  /** Risk book: slots to wait before re-entering a coin whose last exit lost money. */
+  riskLossCooldownSlots: number;
 }
 
 // Settings traded with: picked from flat regions of sweeps over the dev window's four 6-hour
@@ -125,6 +141,12 @@ export const DEFAULT_PARAMS: RiderParams = {
   maxProbes: 1,
   probeFlowWindow: 20,
   probeMinFlow: 0.02,
+
+  riskDrawdownKneeSol: 0.05,
+  riskDrawdownCapSol: 0.3,
+  riskMinStakeFactor: 0.6,
+  riskPerPositionShrink: 0.04,
+  riskLossCooldownSlots: 200,
 };
 
 const LAMPORTS = 1e9;
@@ -153,6 +175,18 @@ interface Ride {
 }
 
 export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
+  const riskParams: RiskParams = {
+    baseStakeSol: p.stakeSol,
+    minStakeSol: p.minBuySol,
+    maxExposureSol: p.maxExposureSol,
+    maxPositions: p.maxMain,
+    drawdownKneeSol: p.riskDrawdownKneeSol,
+    drawdownCapSol: p.riskDrawdownCapSol,
+    minStakeFactor: p.riskMinStakeFactor,
+    perPositionShrink: p.riskPerPositionShrink,
+    lossCooldownSlots: p.riskLossCooldownSlots,
+  };
+  const risk = new RiskBook(riskParams);
   const tapes = new Map<Pubkey, CurveTape>();
   const rides = new Map<Pubkey, Ride>();
   /** Probe round trips in flight, by mint: false while buying, true once selling. */
@@ -303,6 +337,9 @@ export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
         }
         if (orders.length >= cap) break;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
+        // Book the exit in the risk book: a losing exit starts this mint's cooldown
+        // and feeds the realised drawdown that sizes the next entries.
+        risk.noteExit(mint, value - cost, now);
       }
 
       // Probe round trips: sell the whole probe as soon as its buy has landed.
@@ -339,7 +376,12 @@ export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
         const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
         if (!launchSignal(t, now, rqSol, price)) continue;
         const capSol = Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS;
-        let amount = Math.min(capSol, p.stakeSol, p.maxExposureSol - exposure);
+        // Risk-sized stake: the base stake shrunk while the book is in drawdown and
+        // while many positions are already open; the book also enforces the exposure
+        // cap, the concurrent-position cap, and the post-loss cooldown for this mint.
+        const stake = risk.stakeFor(rides.size);
+        let amount = Math.min(capSol, stake, p.maxExposureSol - exposure);
+        if (!risk.canOpen(mint, now, amount, rides.size, exposure)) continue;
         if (amount > free - tx) amount = free - tx;
         if (amount < p.minBuySol) continue;
         const lamports = BigInt(Math.floor(amount * LAMPORTS));
@@ -366,6 +408,8 @@ export function createStrategy(p: RiderParams = DEFAULT_PARAMS): Bot {
             const curve = state.curves.get(mint);
             if (curve === undefined || curve.complete) continue;
             if (Number(curve.real_quote_reserves) / LAMPORTS < minRq * 1.5) continue;
+            // Never probe a coin the risk book is cooling down after a losing exit.
+            if (risk.isCooling(mint, now)) continue;
             const t = tapes.get(mint);
             if (t !== undefined) {
               if (flow(t, now, p.probeFlowWindow) < p.probeMinFlow) continue;
